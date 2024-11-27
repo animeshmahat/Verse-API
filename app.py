@@ -7,15 +7,10 @@ from nltk.tokenize import sent_tokenize, word_tokenize
 from sklearn.metrics.pairwise import cosine_similarity
 import networkx as nx
 
-# Initialize Flask app
 app = Flask(__name__)
 
-# Pre-load NLTK resources at app startup
-nltk.download('punkt')
-nltk.download('stopwords')
 stop_words = set(nltk.corpus.stopwords.words('english'))
 
-# Load the logistic regression model and TF-IDF vectorizer from pickle files
 with open('logistic_regression_model.pkl', 'rb') as model_file:
     model = pickle.load(model_file)
 
@@ -74,13 +69,6 @@ def tokenize_words(sentence):
     words = word_tokenize(sentence.lower())
     return [word for word in words if word not in stop_words and word.isalnum()]
 
-def sentence_similarity(sent1, sent2):
-    words1 = tokenize_words(sent1)
-    words2 = tokenize_words(sent2)
-    all_words = list(set(words1 + words2))
-    vector1 = [1 if word in words1 else 0 for word in all_words]
-    vector2 = [1 if word in words2 else 0 for word in all_words]
-    return cosine_similarity([vector1], [vector2])[0][0]
 
 # Build similarity matrix
 def build_similarity_matrix(sentences):
@@ -93,28 +81,72 @@ def build_similarity_matrix(sentences):
                 matrix[i][j] = sentence_similarity(sentences[i], sentences[j])
     return matrix
 
-def rank_sentences(similarity_matrix):
+# Modify sentence_similarity to incorporate TF-IDF
+def sentence_similarity(sent1, sent2, tfidf_vectorizer=None):
+    # Use TF-IDF for similarity calculation if available
+    if tfidf_vectorizer:
+        vector1 = tfidf_vectorizer.transform([sent1])
+        vector2 = tfidf_vectorizer.transform([sent2])
+        return cosine_similarity(vector1, vector2)[0][0]
+
+    # Fallback to word overlap similarity
+    words1 = tokenize_words(sent1)
+    words2 = tokenize_words(sent2)
+    all_words = list(set(words1 + words2))
+    vector1 = [1 if word in words1 else 0 for word in all_words]
+    vector2 = [1 if word in words2 else 0 for word in all_words]
+    return cosine_similarity([vector1], [vector2])[0][0]
+
+def rank_sentences(similarity_matrix, sentences, tfidf_vectorizer):
     if similarity_matrix.size == 0:
         return {}
+
+    # Apply PageRank on the similarity matrix
     graph = nx.from_numpy_array(similarity_matrix)
     scores = nx.pagerank(graph)
+
+    # Advanced scoring: Add extra weights for key phrases, introductory, or concluding sentences
+    for i, sentence in enumerate(sentences):
+        if i == 0 or i == len(sentences) - 1:  # Introductory or concluding sentence
+            scores[i] += 0.1
+        if any(phrase in sentence.lower() for phrase in ["in conclusion", "to summarize"]):
+            scores[i] += 0.2
+
     return scores
 
-# Summarize function with no logic change
-def generate_summary(sentences, sentence_scores, summary_ratio=0.3, min_sentence_length=5, bullet_points=False):
-    # Rank sentences by score but keep track of their original index
-    ranked_sentences = sorted(((i, sentence_scores[i], s) for i, s in enumerate(sentences)), key=lambda x: x[1],
-                              reverse=True)
-    ranked_sentences = [(i, score, s) for i, score, s in ranked_sentences if len(s.split()) >= min_sentence_length]
+def remove_redundant_sentences(selected_sentences):
+    seen = set()
+    result = []
+    for _, _, sentence in selected_sentences:
+        if sentence not in seen:
+            result.append(sentence)
+            seen.add(sentence)
+    return result
 
-    # Select the top sentences based on summary_ratio
+def generate_summary(sentences, sentence_scores, tfidf_vectorizer, summary_ratio=0.3, bullet_points=False):
+    # Adaptive summary_ratio for shorter texts
+    if len(sentences) < 10:
+        summary_ratio = 0.5
+
+    # Rank sentences and apply penalties for length
+    ranked_sentences = sorted(
+        ((i, sentence_scores[i] - (0.05 if len(s.split()) > 50 or len(s.split()) < 5 else 0), s)
+         for i, s in enumerate(sentences)),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    # Select top sentences based on summary_ratio
     summary_length = max(int(len(sentences) * summary_ratio), 1)
-    selected_sentences = sorted(ranked_sentences[:summary_length], key=lambda x: x[0])  # Sort by the original index
+    selected_sentences = sorted(ranked_sentences[:summary_length], key=lambda x: x[0])
+
+    # Remove redundant sentences
+    final_sentences = remove_redundant_sentences(selected_sentences)
 
     if bullet_points:
-        return [f"{s}" for _, _, s in selected_sentences]  # Return as bullet points in original order
+        return [f"{s}" for s in final_sentences]
     else:
-        summary = ' '.join([s for _, _, s in selected_sentences])
+        summary = ' '.join(final_sentences)
         if not summary.endswith(('.', '?', '!')):
             summary += '.'
         return summary
@@ -138,15 +170,17 @@ def summarize():
         # Tokenize into sentences
         sentences = tokenize_sentences(clean_text)
 
-        # Build similarity matrix and rank sentences
+        # Build similarity matrix and rank sentences using TF-IDF
         similarity_matrix = build_similarity_matrix(sentences)
         if similarity_matrix.size == 0:
             return jsonify({'paragraph': '', 'bullet_points': []}), 200
-        sentence_scores = rank_sentences(similarity_matrix)
 
-        # Generate summary in both formats
-        paragraph_summary = generate_summary(sentences, sentence_scores, summary_ratio=0.35)
-        bullet_point_summary = generate_summary(sentences, sentence_scores, summary_ratio=0.35, bullet_points=True)
+        # Rank sentences using advanced scoring
+        sentence_scores = rank_sentences(similarity_matrix, sentences, vectorizer)
+
+        # Generate summaries in both formats
+        paragraph_summary = generate_summary(sentences, sentence_scores, vectorizer, summary_ratio=0.35)
+        bullet_point_summary = generate_summary(sentences, sentence_scores, vectorizer, summary_ratio=0.35, bullet_points=True)
 
         return jsonify({
             'paragraph': paragraph_summary,
@@ -155,6 +189,7 @@ def summarize():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 # Run the Flask app
 if __name__ == '__main__':
